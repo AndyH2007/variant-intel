@@ -1,0 +1,4 @@
+protein,position,ref_aa,alt_aa,label
+EGFR,790,L,M,Up
+BRCA1,1203,S,F,Down
+TP53,175,R,H,Neutral
