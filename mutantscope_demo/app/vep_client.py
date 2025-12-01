@@ -87,7 +87,7 @@ def fetch_vep_annotation(
     encoded_hgvs = quote(hgvs_notation, safe="")
     params = _build_query_params(extra_params)
     qs = urlencode(params, doseq=True)
-    url = f"{VEP_BASE_URL}/{quote(species, safe='')}/hgvs/{encoded_hgvs}?{qs}"
+    url = f"{VEP_BASE_URL}/{quote(species, safe='')}/hgvs/{encoded_hgvs}?{qs}?refsq=1"
 
     req = Request(
         url,

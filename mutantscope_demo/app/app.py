@@ -1,6 +1,10 @@
 # app/app.py
 import sys, pathlib, json, re, datetime as dt
+from datetime import timezone
 from typing import List, Dict, Any, Optional
+from xml.etree import ElementTree
+from urllib.request import urlopen, Request
+from urllib.error import HTTPError, URLError
 
 APP_DIR = pathlib.Path(__file__).resolve().parent
 if str(APP_DIR) not in sys.path:
@@ -38,9 +42,10 @@ div.block-container { padding-top: .75rem; padding-bottom: 2rem; }
 .gbar > div { height:10px; background:#3b82f6; width:0%; }
 
 /* Chip grid */
+.tag-container { max-height: 300px; overflow-y: auto; overflow-x: hidden; padding: 4px 0; }
 .tag { display:inline-block; margin:6px 8px 0 0; padding:6px 12px;
        border-radius:999px; border:1px solid #2b2f36; background:#14171c; font-size:.92rem;
-       max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+       white-space:normal; word-wrap:break-word; max-width:none; }
 
 /* Row layout */
 .grid2 { display:grid; grid-template-columns: 1fr 1fr; gap:18px; }
@@ -76,7 +81,7 @@ hgvs = st.sidebar.text_input("HGVS notation (GRCh38)",
     value="NC_000023.11:g.153866826C>T", key="input_hgvs",
     help="Example: NC_000023.11:g.153866826C>T")
 species = st.sidebar.selectbox("Species", ["human"], index=0, key="input_species")
-fetch_btn = st.sidebar.button("Fetch from VEP", use_container_width=True)
+fetch_btn = st.sidebar.button("Fetch from VEP", width='stretch')
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("## Profile / Priors")
@@ -97,20 +102,28 @@ def safe_float(x) -> Optional[float]:
     try: return float(x)
     except: return None
 
-def severity_badge(score: float) -> str:
+def severity_badge(pathogenic_count: int, uncertain_count: int, benign_count: int, total_count: int) -> str:
     """
-    Map a 0-5 score to a qualitative badge.
+    Display pathogenicity assessment based on tool counts.
     """
-    score = max(0.0, min(5.0, score))
-    if score >= 4.0:
+    if total_count == 0:
+        bg, dot, bd, txt = "#1e1e27", "#a5b4fc", "#303046", "no data available"
+        return f"""<span class="badge dot" style="--bg:{bg};--dot:{dot};--bd:{bd}">Pathogenicity: {txt}</span>"""
+    
+    # Determine overall assessment based on counts
+    if pathogenic_count > benign_count and pathogenic_count > uncertain_count:
         bg, dot, bd, txt = "#10231c", "#22c55e", "#1f422e", "likely pathogenic"
-    elif score >= 3.0:
-        bg, dot, bd, txt = "#2b1d00", "#f59e0b", "#433214", "uncertain — leaning pathogenic"
-    elif score >= 2.0:
+    elif benign_count > pathogenic_count and benign_count > uncertain_count:
+        bg, dot, bd, txt = "#22191a", "#ef4444", "#402728", "likely benign"
+    elif uncertain_count >= pathogenic_count and uncertain_count >= benign_count:
         bg, dot, bd, txt = "#1e1e27", "#a5b4fc", "#303046", "uncertain significance"
+    elif pathogenic_count == benign_count:
+        bg, dot, bd, txt = "#2b1d00", "#f59e0b", "#433214", "conflicting evidence"
     else:
-        bg, dot, bd, txt = "#22191a", "#ef4444", "#402728", "likely benign / conflicting"
-    return f"""<span class="badge dot" style="--bg:{bg};--dot:{dot};--bd:{bd}">Pathogenicity: {txt} (index {score:.1f}/5)</span>"""
+        bg, dot, bd, txt = "#2b1d00", "#f59e0b", "#433214", "uncertain — leaning pathogenic"
+    
+    summary = f"Pathogenic: {pathogenic_count}, Uncertain: {uncertain_count}, Benign: {benign_count} (of {total_count} tools)"
+    return f"""<span class="badge dot" style="--bg:{bg};--dot:{dot};--bd:{bd}">Pathogenicity: {txt} — {summary}</span>"""
 
 def interpret_ranges(value, cut_low, cut_high, good_low=True):
     """Return a short interpretation string vs cutoffs."""
@@ -148,10 +161,8 @@ def chip_grid(items: List[str], cols=3, key_prefix="chips", placeholder="Filter�
     if flt:
         q = flt.lower()
         items = sorted([x for x in items if q in x.lower()], key=lambda s: s.lower().find(q))
-    cols_list = st.columns(cols)
-    for i, s in enumerate(items):
-        with cols_list[i % cols]:
-            st.markdown(f"<span class='tag' title='{s}'>{s}</span>", unsafe_allow_html=True)
+    tags_html = "".join([f"<span class='tag' title='{s}'>{s}</span>" for s in items])
+    st.markdown(f"<div class='tag-container'>{tags_html}</div>", unsafe_allow_html=True)
 
 def gbar(value: Optional[float], min_val: float, max_val: float, suffix: str = "", key: str = ""):
     if value is None:
@@ -167,71 +178,206 @@ def gbar(value: Optional[float], min_val: float, max_val: float, suffix: str = "
     <div class="help">{value}{suffix}</div>
     """, unsafe_allow_html=True)
 
-def compute_pathogenicity_index(s: Dict[str, Any]) -> (float, List[Dict[str, Any]]):
+def compute_pathogenicity_index(s: Dict[str, Any]) -> (int, int, int, List[Dict[str, Any]]):
     """
-    Simple transparent heuristic (0-5) used ONLY to render the badge.
-    Weights are deliberately small and additive; this is NOT ACMG classification.
+    Count tools that indicate pathogenic, uncertain, or benign.
+    Returns: (pathogenic_count, uncertain_count, benign_count, evidence_table_rows)
     """
-    w = []  # rows for the evidence table (Source, Value, Interpretation, Weight)
-    score = 0.0
+    w = []  # rows for the evidence table (Source, Value, Interpretation, Assessment)
+    pathogenic_count = 0
+    uncertain_count = 0
+    benign_count = 0
 
     # ClinVar
     clin = ", ".join(s.get("clinvar_significance") or []) or ""
-    if "pathogenic" in clin:
-        score += 3.0; w.append({"Source":"ClinVar","Value":clin,"Interpretation":"Reported pathogenic","Weight":"+3.0"})
-    elif "likely_pathogenic" in clin:
-        score += 2.5; w.append({"Source":"ClinVar","Value":clin,"Interpretation":"Likely pathogenic","Weight":"+2.5"})
+    if "pathogenic" in clin.lower() or "likely_pathogenic" in clin.lower():
+        pathogenic_count += 1
+        w.append({"Source":"ClinVar","Value":clin,"Interpretation":"Reported pathogenic/likely pathogenic","Assessment":"Pathogenic"})
+    elif "benign" in clin.lower() or "likely_benign" in clin.lower():
+        benign_count += 1
+        w.append({"Source":"ClinVar","Value":clin,"Interpretation":"Reported benign/likely benign","Assessment":"Benign"})
     elif clin:
-        w.append({"Source":"ClinVar","Value":clin,"Interpretation":"Other/conflicting","Weight":"+0.0"})
+        uncertain_count += 1
+        w.append({"Source":"ClinVar","Value":clin,"Interpretation":"Other/conflicting","Assessment":"Uncertain"})
 
     # AlphaMissense
     am = s.get("alphamissense") or {}
     amc = (am.get("class") or "").lower()
     ams = safe_float(am.get("score"))
     if amc in ("pathogenic","likely_pathogenic"):
-        score += 1.0; w.append({"Source":"AlphaMissense","Value":f"{am.get('class')} ({ams})","Interpretation":"AI pathogenic class","Weight":"+1.0"})
-    elif ams and ams >= 0.8:
-        score += 0.6; w.append({"Source":"AlphaMissense","Value":f"{ams}","Interpretation":"High score (≥0.8)","Weight":"+0.6"})
-    elif ams:
-        w.append({"Source":"AlphaMissense","Value":f"{ams}","Interpretation":"Moderate/low","Weight":"+0.0"})
+        pathogenic_count += 1
+        w.append({"Source":"AlphaMissense","Value":f"{am.get('class')} ({ams})","Interpretation":"AI pathogenic class","Assessment":"Pathogenic"})
+    elif amc in ("benign","likely_benign"):
+        benign_count += 1
+        w.append({"Source":"AlphaMissense","Value":f"{am.get('class')} ({ams})","Interpretation":"AI benign class","Assessment":"Benign"})
+    elif ams is not None:
+        if ams >= 0.8:
+            pathogenic_count += 1
+            w.append({"Source":"AlphaMissense","Value":f"{ams}","Interpretation":"High score (≥0.8)","Assessment":"Pathogenic"})
+        elif ams <= 0.2:
+            benign_count += 1
+            w.append({"Source":"AlphaMissense","Value":f"{ams}","Interpretation":"Low score (≤0.2)","Assessment":"Benign"})
+        else:
+            uncertain_count += 1
+            w.append({"Source":"AlphaMissense","Value":f"{ams}","Interpretation":"Moderate score","Assessment":"Uncertain"})
 
     # REVEL
     revel = safe_float(s.get("revel"))
     if revel is not None:
-        if revel >= pri["revel_strong"]: score += 0.6; w.append({"Source":"REVEL","Value":revel,"Interpretation":"Strong (≥0.75)","Weight":"+0.6"})
-        elif revel >= pri["revel_cutoff"]: score += 0.3; w.append({"Source":"REVEL","Value":revel,"Interpretation":"Suggestive (≥0.5)","Weight":"+0.3"})
-        else: w.append({"Source":"REVEL","Value":revel,"Interpretation":"Below damaging cutoffs","Weight":"+0.0"})
+        if revel >= pri["revel_strong"]:
+            pathogenic_count += 1
+            w.append({"Source":"REVEL","Value":revel,"Interpretation":f"Strong (≥{pri['revel_strong']})","Assessment":"Pathogenic"})
+        elif revel >= pri["revel_cutoff"]:
+            uncertain_count += 1
+            w.append({"Source":"REVEL","Value":revel,"Interpretation":f"Suggestive (≥{pri['revel_cutoff']})","Assessment":"Uncertain"})
+        else:
+            benign_count += 1
+            w.append({"Source":"REVEL","Value":revel,"Interpretation":"Below damaging cutoffs","Assessment":"Benign"})
 
     # CADD
     cadd = safe_float(s.get("cadd_phred"))
     if cadd is not None:
-        if cadd >= 30: score += 0.6; w.append({"Source":"CADD","Value":cadd,"Interpretation":"Very high (≥30)","Weight":"+0.6"})
-        elif cadd >= pri["cadd_cutoff"]: score += 0.3; w.append({"Source":"CADD","Value":cadd,"Interpretation":f"High (≥{pri['cadd_cutoff']})","Weight":"+0.3"})
-        else: w.append({"Source":"CADD","Value":cadd,"Interpretation":"Low/Moderate","Weight":"+0.0"})
+        if cadd >= 30:
+            pathogenic_count += 1
+            w.append({"Source":"CADD","Value":cadd,"Interpretation":"Very high (≥30)","Assessment":"Pathogenic"})
+        elif cadd >= pri["cadd_cutoff"]:
+            uncertain_count += 1
+            w.append({"Source":"CADD","Value":cadd,"Interpretation":f"High (≥{pri['cadd_cutoff']})","Assessment":"Uncertain"})
+        else:
+            benign_count += 1
+            w.append({"Source":"CADD","Value":cadd,"Interpretation":"Low/Moderate","Assessment":"Benign"})
 
-    # SIFT / PolyPhen
+    # SIFT
     sp = ((s.get("sift") or {}).get("pred") or "").lower()
-    if "del" in sp: score += 0.2; w.append({"Source":"SIFT","Value":sp,"Interpretation":"Deleterious","Weight":"+0.2"})
+    if "del" in sp:
+        pathogenic_count += 1
+        w.append({"Source":"SIFT","Value":sp,"Interpretation":"Deleterious","Assessment":"Pathogenic"})
+    elif sp and "tolerated" in sp:
+        benign_count += 1
+        w.append({"Source":"SIFT","Value":sp,"Interpretation":"Tolerated","Assessment":"Benign"})
+    elif sp:
+        uncertain_count += 1
+        w.append({"Source":"SIFT","Value":sp,"Interpretation":"Other","Assessment":"Uncertain"})
+
+    # PolyPhen-2
     pp = ((s.get("polyphen") or {}).get("pred") or "").lower()
-    if "prob" in pp: score += 0.2; w.append({"Source":"PolyPhen-2","Value":pp,"Interpretation":"Probably damaging","Weight":"+0.2"})
+    if "prob" in pp or "damaging" in pp:
+        pathogenic_count += 1
+        w.append({"Source":"PolyPhen-2","Value":pp,"Interpretation":"Probably/possibly damaging","Assessment":"Pathogenic"})
+    elif "benign" in pp:
+        benign_count += 1
+        w.append({"Source":"PolyPhen-2","Value":pp,"Interpretation":"Benign","Assessment":"Benign"})
+    elif pp:
+        uncertain_count += 1
+        w.append({"Source":"PolyPhen-2","Value":pp,"Interpretation":"Other","Assessment":"Uncertain"})
 
     # Population
     pmax = safe_float(s.get("gnomad_popmax_af"))
     if pmax is not None:
-        if pmax <= pri["af_cutoff"]: score += 1.0; w.append({"Source":"Population","Value":pmax,"Interpretation":"Rare enough for phenotype","Weight":"+1.0"})
-        elif pmax <= pri["af_cutoff"]*10: score += 0.3; w.append({"Source":"Population","Value":pmax,"Interpretation":"Somewhat rare","Weight":"+0.3"})
-        else: w.append({"Source":"Population","Value":pmax,"Interpretation":"Too common for severe phenotype","Weight":"0.0"})
+        if pmax <= pri["af_cutoff"]:
+            pathogenic_count += 1
+            w.append({"Source":"Population","Value":pmax,"Interpretation":"Rare enough for phenotype","Assessment":"Pathogenic"})
+        elif pmax <= pri["af_cutoff"]*10:
+            uncertain_count += 1
+            w.append({"Source":"Population","Value":pmax,"Interpretation":"Somewhat rare","Assessment":"Uncertain"})
+        else:
+            benign_count += 1
+            w.append({"Source":"Population","Value":pmax,"Interpretation":"Too common for severe phenotype","Assessment":"Benign"})
 
     # Conservation
     gerp = safe_float((s.get("conservation") or {}).get("gerp"))
-    if gerp and gerp > 4: score += 0.3; w.append({"Source":"Conservation","Value":gerp,"Interpretation":"GERP++ >4","Weight":"+0.3"})
-    elif gerp and gerp > 2: score += 0.15; w.append({"Source":"Conservation","Value":gerp,"Interpretation":"GERP++ >2","Weight":"+0.15"})
-    else: w.append({"Source":"Conservation","Value":gerp,"Interpretation":"Low/NA","Weight":"+0.0"})
+    if gerp is not None:
+        if gerp > 4:
+            pathogenic_count += 1
+            w.append({"Source":"Conservation","Value":gerp,"Interpretation":"GERP++ >4 (highly conserved)","Assessment":"Pathogenic"})
+        elif gerp > 2:
+            uncertain_count += 1
+            w.append({"Source":"Conservation","Value":gerp,"Interpretation":"GERP++ >2 (moderately conserved)","Assessment":"Uncertain"})
+        else:
+            benign_count += 1
+            w.append({"Source":"Conservation","Value":gerp,"Interpretation":"Low/NA (less conserved)","Assessment":"Benign"})
 
-    return min(5.0, score), w
+    return pathogenic_count, uncertain_count, benign_count, w
+
+def fetch_pubmed_article(pmid: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetch article metadata from PubMed using NCBI E-utilities API.
+    Returns a dict with 'title', 'abstract', 'pub_date', and 'url', or None on error.
+    """
+    if not pmid or not pmid.strip():
+        return None
+    
+    pmid = pmid.strip()
+    base_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+    efetch_url = f"{base_url}efetch.fcgi?db=pubmed&id={pmid}&retmode=xml"
+    
+    try:
+        req = Request(
+            efetch_url,
+            headers={
+                "User-Agent": "precision-med-client/1.0",
+            },
+        )
+        with urlopen(req, timeout=10) as resp:
+            xml_content = resp.read()
+        
+        root = ElementTree.fromstring(xml_content)
+        
+        # Extract article information
+        article = root.find(".//PubmedArticle")
+        if article is None:
+            return None
+        
+        # Title
+        title_elem = article.find(".//ArticleTitle")
+        title = title_elem.text if title_elem is not None and title_elem.text else "No title available"
+        
+        # Abstract
+        abstract_parts = []
+        for abstract_text in article.findall(".//AbstractText"):
+            label = abstract_text.get("Label", "")
+            text = abstract_text.text if abstract_text.text else ""
+            if label:
+                abstract_parts.append(f"{label}: {text}")
+            else:
+                abstract_parts.append(text)
+        abstract = " ".join(abstract_parts) if abstract_parts else "No abstract available"
+        
+        # Publication date
+        pub_date = None
+        pub_date_elem = article.find(".//PubDate")
+        if pub_date_elem is not None:
+            year = pub_date_elem.find("Year")
+            month = pub_date_elem.find("Month")
+            day = pub_date_elem.find("Day")
+            if year is not None and year.text:
+                date_parts = [year.text]
+                if month is not None and month.text:
+                    date_parts.append(month.text)
+                if day is not None and day.text:
+                    date_parts.append(day.text)
+                pub_date = " ".join(date_parts)
+        
+        if not pub_date:
+            # Try MedlineDate as fallback
+            medline_date = article.find(".//MedlineDate")
+            if medline_date is not None and medline_date.text:
+                pub_date = medline_date.text
+            else:
+                pub_date = "Date not available"
+        
+        return {
+            "title": title,
+            "abstract": abstract,
+            "pub_date": pub_date,
+            "url": f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/"
+        }
+    except (HTTPError, URLError, ElementTree.ParseError, Exception) as e:
+        # Return None on any error - we'll just show the link without metadata
+        return None
 
 def painlessly_download_button(label, content, filename):
-    st.download_button(label, data=content, file_name=filename, use_container_width=True)
+    st.download_button(label, data=content, file_name=filename, width='stretch')
 
 def bookmark_current(summary: Dict[str, Any], note: str = ""):
     if not summary: return
@@ -247,7 +393,7 @@ def bookmark_current(summary: Dict[str, Any], note: str = ""):
         "cadd": summary.get("cadd_phred"),
         "am_class": (summary.get("alphamissense") or {}).get("class"),
         "am_score": (summary.get("alphamissense") or {}).get("score"),
-        "timestamp": dt.datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "timestamp": dt.datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "note": note.strip()
     })
 
@@ -276,7 +422,8 @@ def render_single():
         return
 
     # ---- HERO OVERVIEW ----
-    score, weights = compute_pathogenicity_index(s)
+    pathogenic_count, uncertain_count, benign_count, weights = compute_pathogenicity_index(s)
+    total_count = pathogenic_count + uncertain_count + benign_count
     st.markdown('<div class="hero-grid">', unsafe_allow_html=True)
     st.markdown(f'''
       <div class="hero"><div class="k">Gene</div><div class="v">{s.get("gene") or "—"}</div></div>
@@ -286,14 +433,14 @@ def render_single():
     ''', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
-    st.markdown(severity_badge(score), unsafe_allow_html=True)
+    st.markdown(severity_badge(pathogenic_count, uncertain_count, benign_count, total_count), unsafe_allow_html=True)
     st.caption(f"Context: {pri['disease_context']}")
 
     # Actions row
     a1, a2, a3, a4 = st.columns([1,1,1,2])
     with a1:
         note = st.text_input("Optional note for bookmark", "", key="bm_note")
-        if st.button("🔖 Bookmark this variant", use_container_width=True, key="bm_btn"):
+        if st.button("🔖 Bookmark this variant", width='stretch', key="bm_btn"):
             bookmark_current(s, note)
             st.success("Bookmarked.")
     with a2:
@@ -308,7 +455,7 @@ def render_single():
 - REVEL: **{s.get('revel')}**, CADD: **{s.get('cadd_phred')}**, AlphaMissense: **{(s.get('alphamissense') or {}).get('class')}** ({(s.get('alphamissense') or {}).get('score')})
 - AF: **{s.get('gnomad_af')}**, PopMax: **{s.get('gnomad_popmax_af')}**
 
-> Heuristic pathogenicity index: {score:.1f}/5 (NOT ACMG).
+> Pathogenicity assessment: Pathogenic: {pathogenic_count}, Uncertain: {uncertain_count}, Benign: {benign_count} (of {total_count} tools) (NOT ACMG).
 """
         painlessly_download_button("📝 Export Markdown", md, f"{s.get('hgvsg','variant')}.md")
     with a4:
@@ -322,9 +469,21 @@ def render_single():
 
     with L:
         st.subheader("Clinical")
-        st.write("**ClinVar significance:**", ", ".join(s.get("clinvar_significance") or []) or "—")
+        clinvar_sig = s.get("clinvar_significance") or []
+        if clinvar_sig:
+            st.write("**ClinVar significance:**")
+            tags_html = "".join([f"<span class='tag' title='{sig}'>{sig}</span>" for sig in clinvar_sig])
+            st.markdown(f"<div class='tag-container'>{tags_html}</div>", unsafe_allow_html=True)
+        else:
+            st.write("**ClinVar significance:** —")
         st.caption("Curation by clinical labs; strongest single source when available.")
-        st.write("**ClinVar review:**", ", ".join(s.get("clinvar_review") or []) or "—")
+        clinvar_rev = s.get("clinvar_review") or []
+        if clinvar_rev:
+            st.write("**ClinVar review:**")
+            tags_html = "".join([f"<span class='tag' title='{rev}'>{rev}</span>" for rev in clinvar_rev])
+            st.markdown(f"<div class='tag-container'>{tags_html}</div>", unsafe_allow_html=True)
+        else:
+            st.write("**ClinVar review:** —")
 
         # Phenotype matcher
         phs = s.get("phenotypes") or []
@@ -370,9 +529,11 @@ def render_single():
     # ---- Evidence table (structured overview) ----
     st.subheader("Structured evidence overview")
     import pandas as pd
-    df = pd.DataFrame(weights, columns=["Source","Value","Interpretation","Weight"])
-    st.dataframe(df, use_container_width=True, hide_index=True)
-    st.caption("Heuristic evidence and weights used for the badge above (NOT ACMG classification).")
+    df = pd.DataFrame(weights, columns=["Source","Value","Interpretation","Assessment"])
+    # Convert Value column to string to avoid Arrow serialization issues with mixed types
+    df["Value"] = df["Value"].astype(str)
+    st.dataframe(df, width='stretch', hide_index=True)
+    st.caption("Tool assessments categorized as Pathogenic, Uncertain, or Benign (NOT ACMG classification).")
 
     # ---- Domains & GO ----
     st.subheader("Domains & GO")
@@ -411,9 +572,42 @@ def render_single():
     st.subheader("Literature")
     pmids = s.get("pubmed_ids") or []
     if pmids:
-        for pid in pmids[:20]:
-            st.write(f"- PubMed: https://pubmed.ncbi.nlm.nih.gov/{pid}/")
-        if len(pmids) > 20: st.caption(f"...and {len(pmids)-20} more")
+        # Limit to first 20 to avoid too many API calls
+        display_pmids = pmids[:20]
+        
+        # Fetch all articles first
+        articles = {}
+        if display_pmids:
+            with st.spinner(f"Loading article metadata ({len(display_pmids)} articles)..."):
+                for pid in display_pmids:
+                    articles[pid] = fetch_pubmed_article(pid)
+        
+        # Display articles
+        for idx, pid in enumerate(display_pmids):
+            with st.container(border=True):
+                article = articles.get(pid)
+                
+                if article:
+                    # Display title as a link
+                    st.markdown(f"**[{article['title']}]({article['url']})**")
+                    
+                    # Display publication date
+                    st.caption(f"📅 Published: {article['pub_date']}")
+                    
+                    # Display abstract with expander
+                    with st.expander("📄 Abstract", expanded=False):
+                        st.write(article['abstract'])
+                else:
+                    # Fallback: just show the link if metadata fetch failed
+                    st.write(f"**PubMed:** [https://pubmed.ncbi.nlm.nih.gov/{pid}/](https://pubmed.ncbi.nlm.nih.gov/{pid}/)")
+                    st.caption("⚠️ Unable to fetch article metadata")
+            
+            # Add spacing between articles
+            if idx < len(display_pmids) - 1:
+                st.markdown("<br>", unsafe_allow_html=True)
+        
+        if len(pmids) > 20:
+            st.caption(f"ℹ️ Showing first 20 of {len(pmids)} articles. Remaining {len(pmids)-20} articles not displayed.")
     else:
         st.info("No PubMed IDs found in this payload.")
 
@@ -454,7 +648,10 @@ def render_batch():
             })
     import pandas as pd
     df = pd.DataFrame([{k:v for k,v in r.items() if k != "_summary"} for r in rows])
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    # Convert all columns to string to avoid Arrow serialization issues with mixed types
+    for col in df.columns:
+        df[col] = df[col].astype(str)
+    st.dataframe(df, width='stretch', hide_index=True)
     options = [f"{r['HGVS']} ({r.get('Gene') or '—'})" for r in rows]
     pick = st.multiselect("Bookmark selected", options)
     if st.button("Add to bookmarks"):
@@ -519,7 +716,11 @@ def render_compare():
         row("AlphaMissense score", a.get("am_score"), b.get("am_score")),
         row("Note", a.get("note",""), b.get("note","")),
     ]
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    df_compare = pd.DataFrame(rows)
+    # Convert all columns to string to avoid Arrow serialization issues with mixed types
+    for col in df_compare.columns:
+        df_compare[col] = df_compare[col].astype(str)
+    st.dataframe(df_compare, width='stretch', hide_index=True)
 
 # ---------------- Router ----------------
 if mode == "Single":
