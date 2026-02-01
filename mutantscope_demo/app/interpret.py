@@ -99,9 +99,20 @@ def summarize_variant(vep_json: List[Dict[str, Any]]) -> Dict[str, Any]:
     cadd_phred = _to_float(_get_first(tc0, "cadd_phred"))
     revel_score = _to_float(_get_first(tc0, "revel", "revel_score"))
 
-    # Population
+    # Population - gnomAD v4.1 joint (global, best overall estimate)
     af = _to_float(_get_first(tc0, "gnomad4.1_joint_af"))
+    ac = _to_float(_get_first(tc0, "gnomad4.1_joint_ac"))  # Allele Count
+    
+    # Population - gnomAD v4.1 popmax (safety check)
     popmax_af = _to_float(_get_first(tc0, "gnomad4.1_joint_popmax_af"))
+    popmax_an = _to_float(_get_first(tc0, "gnomad4.1_joint_popmax_an"))  # Allele Number for popmax
+    
+    # Recessive carrier context - homozygotes
+    nhomalt = _to_float(_get_first(tc0, "gnomad4.1_joint_nhomalt"))
+    
+    # Control population (gnomAD v2.1.1 exomes controls - closest to healthy baseline)
+    controls_af = _to_float(_get_first(tc0, "gnomad2.1.1_exomes_controls_af"))
+    controls_an = _to_float(_get_first(tc0, "gnomad2.1.1_exomes_controls_an"))
 
     # Conservation
     gerp = _to_float(_get_first(tc0, "gerp++_nr", "gerp_91_mammals"))
@@ -136,8 +147,20 @@ def summarize_variant(vep_json: List[Dict[str, Any]]) -> Dict[str, Any]:
         "cadd_phred": cadd_phred,
         "revel": revel_score,
 
+        # gnomAD v4.1 joint - global population (best overall estimate)
         "gnomad_af": af,
+        "gnomad_ac": ac,  # Allele count - more intuitive than tiny decimals
+        
+        # gnomAD v4.1 popmax - safety check (most common in any population)
         "gnomad_popmax_af": popmax_af,
+        "gnomad_popmax_an": popmax_an,
+        
+        # Recessive carrier context
+        "gnomad_nhomalt": nhomalt,  # Number of homozygotes
+        
+        # gnomAD v2.1.1 controls - healthy baseline population
+        "gnomad_controls_af": controls_af,
+        "gnomad_controls_an": controls_an,
 
         "conservation": {"gerp": gerp, "phastcons100way": phastcons},
         "domains": _uniq(domains),

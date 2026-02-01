@@ -54,6 +54,11 @@ hr { border:none; height:1px; background:#1d222a; margin:10px 0 14px 0; }
 /* evidence table tweaks */
 thead tr th { position: sticky; top: 0; background: #0e1318; }
 .help { opacity:.75; font-size:.85rem; }
+
+/* Population genetics section */
+div[data-testid="stMetric"] { background: transparent; }
+div[data-testid="stMetric"] label { font-size: 0.85rem !important; opacity: 0.8; }
+div[data-testid="stMetric"] [data-testid="stMetricValue"] { font-size: 1.1rem !important; font-weight: 600; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -81,7 +86,7 @@ hgvs = st.sidebar.text_input("HGVS notation (GRCh38)",
     value="NC_000023.11:g.153866826C>T", key="input_hgvs",
     help="Example: NC_000023.11:g.153866826C>T")
 species = st.sidebar.selectbox("Species", ["human"], index=0, key="input_species")
-fetch_btn = st.sidebar.button("Fetch from VEP", width='stretch')
+fetch_btn = st.sidebar.button("Fetch from VEP")
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("## Profile / Priors")
@@ -154,6 +159,92 @@ def explain_af(af, popmax):
     if v <= cutoff:    return txt + "Rare enough for the current phenotype."
     if v <= cutoff*10: return txt + "Somewhat common; consider inheritance/penetrance."
     return txt + "Too common for most severe Mendelian disorders."
+
+def fmt_af(val) -> str:
+    """Format allele frequency for display."""
+    if val is None:
+        return "—"
+    try:
+        v = float(val)
+        if v == 0:
+            return "0 (absent)"
+        if v < 1e-6:
+            return f"{v:.2e}"
+        if v < 0.001:
+            return f"{v:.4e}"
+        return f"{v:.4f}"
+    except:
+        return str(val)
+
+def fmt_count(val) -> str:
+    """Format allele count or number for display."""
+    if val is None:
+        return "—"
+    try:
+        v = int(float(val))
+        if v >= 1000000:
+            return f"{v:,} (~{v/1000000:.1f}M)"
+        if v >= 1000:
+            return f"{v:,} (~{v/1000:.0f}K)"
+        return f"{v:,}"
+    except:
+        return str(val)
+
+def interpret_controls_af(af, an):
+    """Interpret control population frequency for clinical context."""
+    cutoff = pri["af_cutoff"]
+    if af is None:
+        return "No data in controls subset."
+    try:
+        v = float(af)
+        n = int(float(an)) if an else 0
+    except:
+        return "Unable to interpret."
+    
+    confidence = "high confidence" if n >= 80000 else "moderate confidence" if n >= 20000 else "low confidence (small sample)"
+    
+    if v == 0:
+        return f"Absent in healthy controls ({confidence}). Supports pathogenicity."
+    if v <= cutoff:
+        return f"Ultra-rare in healthy controls ({confidence}). Compatible with rare disease."
+    if v <= cutoff * 10:
+        return f"Rare but present in controls ({confidence}). Warrants caution."
+    return f"Common in healthy controls ({confidence}). Strong evidence against severe pathogenicity."
+
+def interpret_popmax(af, an):
+    """Interpret population maximum frequency for safety check."""
+    if af is None:
+        return "No PopMax data available."
+    try:
+        v = float(af)
+        n = int(float(an)) if an else 0
+    except:
+        return "Unable to interpret."
+    
+    confidence = "reliable" if n >= 10000 else "limited data"
+    
+    if v >= 0.05:  # 5% threshold
+        return f"⚠️ Common in at least one population (≥5%) — typically classified as benign ({confidence})."
+    if v >= 0.01:
+        return f"Somewhat common in specific population (1-5%) — unlikely to cause severe Mendelian disease ({confidence})."
+    if v >= 0.001:
+        return f"Rare but detectable in specific population (0.1-1%) — possible founder effect ({confidence})."
+    return f"Very rare across all populations ({confidence}). Compatible with rare disease."
+
+def interpret_homozygotes(nhomalt, consequence):
+    """Interpret homozygote count for recessive disease context."""
+    if nhomalt is None:
+        return "No homozygote data available."
+    try:
+        n = int(float(nhomalt))
+    except:
+        return "Unable to interpret."
+    
+    if n == 0:
+        return "No healthy homozygotes observed. Compatible with severe recessive disease."
+    if n <= 5:
+        return f"{n} homozygote(s) observed. May still be compatible with reduced penetrance or late-onset disease."
+    return f"⚠️ {n} healthy homozygotes observed. Strong evidence against severe childhood-onset recessive disease."
 
 def chip_grid(items: List[str], cols=3, key_prefix="chips", placeholder="Filter…"):
     items = [x for x in (items or []) if x]
@@ -247,55 +338,120 @@ def compute_pathogenicity_index(s: Dict[str, Any]) -> (int, int, int, List[Dict[
             benign_count += 1
             w.append({"Source":"CADD","Value":cadd,"Interpretation":"Low/Moderate","Assessment":"Benign"})
 
-    # SIFT
-    sp = ((s.get("sift") or {}).get("pred") or "").lower()
-    if "del" in sp:
-        pathogenic_count += 1
-        w.append({"Source":"SIFT","Value":sp,"Interpretation":"Deleterious","Assessment":"Pathogenic"})
-    elif sp and "tolerated" in sp:
-        benign_count += 1
-        w.append({"Source":"SIFT","Value":sp,"Interpretation":"Tolerated","Assessment":"Benign"})
-    elif sp:
-        uncertain_count += 1
-        w.append({"Source":"SIFT","Value":sp,"Interpretation":"Other","Assessment":"Uncertain"})
-
-    # PolyPhen-2
-    pp = ((s.get("polyphen") or {}).get("pred") or "").lower()
-    if "prob" in pp or "damaging" in pp:
-        pathogenic_count += 1
-        w.append({"Source":"PolyPhen-2","Value":pp,"Interpretation":"Probably/possibly damaging","Assessment":"Pathogenic"})
-    elif "benign" in pp:
-        benign_count += 1
-        w.append({"Source":"PolyPhen-2","Value":pp,"Interpretation":"Benign","Assessment":"Benign"})
-    elif pp:
-        uncertain_count += 1
-        w.append({"Source":"PolyPhen-2","Value":pp,"Interpretation":"Other","Assessment":"Uncertain"})
-
-    # Population
-    pmax = safe_float(s.get("gnomad_popmax_af"))
-    if pmax is not None:
-        if pmax <= pri["af_cutoff"]:
+    # SIFT - predicts if amino acid substitution affects protein function
+    # Score 0.0-1.0: <0.05 = deleterious, ≥0.05 = tolerated (NOTE: opposite direction from PolyPhen)
+    sift_data = s.get("sift") or {}
+    sift_score = safe_float(sift_data.get("score"))
+    sift_pred = (sift_data.get("pred") or "").lower()
+    if sift_score is not None:
+        if sift_score < 0.05:
             pathogenic_count += 1
-            w.append({"Source":"Population","Value":pmax,"Interpretation":"Rare enough for phenotype","Assessment":"Pathogenic"})
-        elif pmax <= pri["af_cutoff"]*10:
-            uncertain_count += 1
-            w.append({"Source":"Population","Value":pmax,"Interpretation":"Somewhat rare","Assessment":"Uncertain"})
+            w.append({"Source":"SIFT","Value":f"{sift_score:.3f}","Interpretation":"Deleterious (<0.05) — affects protein function","Assessment":"Pathogenic"})
         else:
             benign_count += 1
-            w.append({"Source":"Population","Value":pmax,"Interpretation":"Too common for severe phenotype","Assessment":"Benign"})
+            w.append({"Source":"SIFT","Value":f"{sift_score:.3f}","Interpretation":"Tolerated (≥0.05) — protein function likely preserved","Assessment":"Benign"})
+    elif sift_pred:
+        if "del" in sift_pred:
+            pathogenic_count += 1
+            w.append({"Source":"SIFT","Value":sift_pred,"Interpretation":"Deleterious — affects protein function","Assessment":"Pathogenic"})
+        elif "tolerated" in sift_pred:
+            benign_count += 1
+            w.append({"Source":"SIFT","Value":sift_pred,"Interpretation":"Tolerated — protein function likely preserved","Assessment":"Benign"})
 
-    # Conservation
+    # PolyPhen-2 - predicts impact on protein structure/function using sequence & structure features
+    # Score 0.0-1.0: 0-0.15 = benign, 0.15-0.85 = possibly damaging, 0.85-1.0 = probably damaging
+    pp_data = s.get("polyphen") or {}
+    pp_score = safe_float(pp_data.get("score"))
+    pp_pred = (pp_data.get("pred") or "").lower()
+    if pp_score is not None:
+        if pp_score >= 0.85:
+            pathogenic_count += 1
+            w.append({"Source":"PolyPhen-2","Value":f"{pp_score:.3f}","Interpretation":"Probably damaging (≥0.85) — high confidence","Assessment":"Pathogenic"})
+        elif pp_score >= 0.15:
+            uncertain_count += 1
+            w.append({"Source":"PolyPhen-2","Value":f"{pp_score:.3f}","Interpretation":"Possibly damaging (0.15-0.85) — uncertain impact","Assessment":"Uncertain"})
+        else:
+            benign_count += 1
+            w.append({"Source":"PolyPhen-2","Value":f"{pp_score:.3f}","Interpretation":"Benign (<0.15) — tolerated substitution","Assessment":"Benign"})
+    elif pp_pred:
+        if "prob" in pp_pred:
+            pathogenic_count += 1
+            w.append({"Source":"PolyPhen-2","Value":pp_pred,"Interpretation":"Probably damaging — high confidence","Assessment":"Pathogenic"})
+        elif "poss" in pp_pred:
+            uncertain_count += 1
+            w.append({"Source":"PolyPhen-2","Value":pp_pred,"Interpretation":"Possibly damaging — uncertain impact","Assessment":"Uncertain"})
+        elif "benign" in pp_pred:
+            benign_count += 1
+            w.append({"Source":"PolyPhen-2","Value":pp_pred,"Interpretation":"Benign — tolerated substitution","Assessment":"Benign"})
+
+    # Population - prefer controls data, fall back to popmax
+    ctrl_af = safe_float(s.get("gnomad_controls_af"))
+    pmax = safe_float(s.get("gnomad_popmax_af"))
+    nhomalt = safe_float(s.get("gnomad_nhomalt"))
+    
+    # Use controls AF if available (best proxy for healthy population)
+    pop_val = ctrl_af if ctrl_af is not None else pmax
+    if pop_val is not None:
+        val_str = f"{pop_val:.2e}" if pop_val > 0 else "0"
+        source = "Controls AF" if ctrl_af is not None else "PopMax AF"
+        if pop_val == 0:
+            pathogenic_count += 1
+            w.append({"Source": f"Population ({source})", "Value": val_str, "Interpretation": "Absent in reference population", "Assessment": "Pathogenic"})
+        elif pop_val <= pri["af_cutoff"]:
+            pathogenic_count += 1
+            w.append({"Source": f"Population ({source})", "Value": val_str, "Interpretation": "Rare enough for phenotype", "Assessment": "Pathogenic"})
+        elif pop_val <= pri["af_cutoff"]*10:
+            uncertain_count += 1
+            w.append({"Source": f"Population ({source})", "Value": val_str, "Interpretation": "Somewhat rare", "Assessment": "Uncertain"})
+        else:
+            benign_count += 1
+            w.append({"Source": f"Population ({source})", "Value": val_str, "Interpretation": "Too common for severe phenotype", "Assessment": "Benign"})
+    
+    # Homozygote check for recessive context
+    if nhomalt is not None:
+        nhom = int(nhomalt)
+        if nhom == 0:
+            # Supportive for recessive disease (no path count change, just evidence)
+            w.append({"Source": "Homozygotes", "Value": str(nhom), "Interpretation": "No healthy homozygotes — compatible with recessive", "Assessment": "Pathogenic"})
+        elif nhom > 5:
+            benign_count += 1
+            w.append({"Source": "Homozygotes", "Value": str(nhom), "Interpretation": f"{nhom} healthy homozygotes — argues against severe recessive", "Assessment": "Benign"})
+
+    # Conservation - GERP++ (Genomic Evolutionary Rate Profiling)
+    # Measures "rejected substitutions" — difference between neutral and observed evolutionary rates
+    # Score range: typically -12 to +6. Higher = more conserved. >2 moderate, >4 highly conserved
     gerp = safe_float((s.get("conservation") or {}).get("gerp"))
     if gerp is not None:
         if gerp > 4:
             pathogenic_count += 1
-            w.append({"Source":"Conservation","Value":gerp,"Interpretation":"GERP++ >4 (highly conserved)","Assessment":"Pathogenic"})
+            w.append({"Source":"GERP++","Value":f"{gerp:.2f}","Interpretation":"Highly constrained (>4) — strong purifying selection","Assessment":"Pathogenic"})
         elif gerp > 2:
             uncertain_count += 1
-            w.append({"Source":"Conservation","Value":gerp,"Interpretation":"GERP++ >2 (moderately conserved)","Assessment":"Uncertain"})
+            w.append({"Source":"GERP++","Value":f"{gerp:.2f}","Interpretation":"Moderately constrained (2-4) — some evolutionary pressure","Assessment":"Uncertain"})
+        elif gerp > 0:
+            benign_count += 1
+            w.append({"Source":"GERP++","Value":f"{gerp:.2f}","Interpretation":"Weakly constrained (0-2) — limited conservation","Assessment":"Benign"})
         else:
             benign_count += 1
-            w.append({"Source":"Conservation","Value":gerp,"Interpretation":"Low/NA (less conserved)","Assessment":"Benign"})
+            w.append({"Source":"GERP++","Value":f"{gerp:.2f}","Interpretation":"Not constrained (≤0) — neutral or positive selection","Assessment":"Benign"})
+    
+    # Conservation - PhastCons 100-way
+    # Posterior probability of conservation across 100 vertebrate species (phylo-HMM)
+    # Score range: 0.0-1.0. Higher = more conserved. >0.9 highly conserved, >0.95 very highly conserved
+    phastcons = safe_float((s.get("conservation") or {}).get("phastcons100way"))
+    if phastcons is not None:
+        if phastcons >= 0.95:
+            pathogenic_count += 1
+            w.append({"Source":"PhastCons100","Value":f"{phastcons:.3f}","Interpretation":"Very highly conserved (≥0.95) — strong functional constraint","Assessment":"Pathogenic"})
+        elif phastcons >= 0.9:
+            uncertain_count += 1
+            w.append({"Source":"PhastCons100","Value":f"{phastcons:.3f}","Interpretation":"Highly conserved (0.9-0.95) — likely functional","Assessment":"Uncertain"})
+        elif phastcons >= 0.5:
+            uncertain_count += 1
+            w.append({"Source":"PhastCons100","Value":f"{phastcons:.3f}","Interpretation":"Moderately conserved (0.5-0.9) — possible constraint","Assessment":"Uncertain"})
+        else:
+            benign_count += 1
+            w.append({"Source":"PhastCons100","Value":f"{phastcons:.3f}","Interpretation":"Poorly conserved (<0.5) — variable across vertebrates","Assessment":"Benign"})
 
     return pathogenic_count, uncertain_count, benign_count, w
 
@@ -453,7 +609,23 @@ def render_single():
 - Protein: **{s.get('hgvsp','—')}**
 - Consequence: **{s.get('consequence','—')}**, Impact: **{s.get('impact','—')}**
 - REVEL: **{s.get('revel')}**, CADD: **{s.get('cadd_phred')}**, AlphaMissense: **{(s.get('alphamissense') or {}).get('class')}** ({(s.get('alphamissense') or {}).get('score')})
-- AF: **{s.get('gnomad_af')}**, PopMax: **{s.get('gnomad_popmax_af')}**
+
+## Population Genetics (gnomAD)
+
+### Global Population (v4.1)
+- AF: **{fmt_af(s.get('gnomad_af'))}**
+- Allele Count: **{fmt_count(s.get('gnomad_ac'))}**
+
+### Control Population (v2.1.1 exomes controls)
+- Controls AF: **{fmt_af(s.get('gnomad_controls_af'))}**
+- Controls AN: **{fmt_count(s.get('gnomad_controls_an'))}**
+
+### PopMax Safety Check
+- PopMax AF: **{fmt_af(s.get('gnomad_popmax_af'))}**
+- PopMax AN: **{fmt_count(s.get('gnomad_popmax_an'))}**
+
+### Recessive Carrier Context
+- Homozygotes (nhomalt): **{fmt_count(s.get('gnomad_nhomalt'))}**
 
 > Pathogenicity assessment: Pathogenic: {pathogenic_count}, Uncertain: {uncertain_count}, Benign: {benign_count} (of {total_count} tools) (NOT ACMG).
 """
@@ -500,31 +672,126 @@ def render_single():
                 chip_grid(phs, cols=2, key_prefix=f"ph_{s.get('hgvsg','curr')}")
         st.markdown("")
 
-        st.subheader("Population & Conservation")
-        st.write("**gnomAD AF (v4.1):**")
-        st.caption(explain_af(s.get("gnomad_af"), s.get("gnomad_popmax_af")))
-        gbar(safe_float(s.get("gnomad_af")), 0.0, max(pri["af_cutoff"]*20, 1e-3), "", key="afbar")
-        st.write("**PopMax AF:**", s.get("gnomad_popmax_af"))
-        st.write("**GERP++:**", (s.get("conservation") or {}).get("gerp"),)
-        st.caption("Higher means stronger evolutionary constraint.")
-        st.write("**PhastCons 100-way:**", (s.get("conservation") or {}).get("phastcons100way"))
-        st.caption("Probability of conservation across vertebrates.")
+        st.subheader("Population Genetics (gnomAD)")
+        
+        # --- Global Population (gnomAD v4.1) ---
+        with st.container(border=True):
+            st.markdown("**🌍 Global Population** (gnomAD v4.1 joint — ~800K individuals)")
+            g1, g2 = st.columns(2)
+            with g1:
+                st.metric("Allele Frequency", fmt_af(s.get("gnomad_af")))
+            with g2:
+                ac_val = s.get("gnomad_ac")
+                st.metric("Allele Count", fmt_count(ac_val) if ac_val else "—")
+            st.caption("The global AF is your single best number for 'how rare is this variant?'. Allele count shows raw observations.")
+        
+        # --- Control Population (gnomAD v2.1.1 controls) ---
+        with st.container(border=True):
+            st.markdown("**🩺 Control Population** (gnomAD v2.1.1 exomes — healthy baseline)")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.metric("Controls AF", fmt_af(s.get("gnomad_controls_af")))
+            with c2:
+                an_val = s.get("gnomad_controls_an")
+                st.metric("Controls AN", fmt_count(an_val) if an_val else "—")
+            interp = interpret_controls_af(s.get("gnomad_controls_af"), s.get("gnomad_controls_an"))
+            st.caption(interp)
+        
+        # --- PopMax Safety Check ---
+        with st.container(border=True):
+            st.markdown("**⚠️ PopMax Safety Check** (frequency in most common population)")
+            p1, p2 = st.columns(2)
+            with p1:
+                st.metric("PopMax AF", fmt_af(s.get("gnomad_popmax_af")))
+            with p2:
+                pan_val = s.get("gnomad_popmax_an")
+                st.metric("PopMax AN", fmt_count(pan_val) if pan_val else "—")
+            interp = interpret_popmax(s.get("gnomad_popmax_af"), s.get("gnomad_popmax_an"))
+            st.caption(interp)
+        
+        # --- Recessive Carrier Context ---
+        with st.container(border=True):
+            st.markdown("**🧬 Recessive Carrier Context**")
+            nhom = s.get("gnomad_nhomalt")
+            st.metric("Homozygotes (nhomalt)", fmt_count(nhom) if nhom is not None else "—")
+            interp = interpret_homozygotes(nhom, s.get("consequence"))
+            st.caption(interp)
+        
+        st.markdown("---")
+        st.subheader("Conservation")
+        
+        with st.container(border=True):
+            st.markdown("**GERP++** (Genomic Evolutionary Rate Profiling)")
+            gerp_val = (s.get("conservation") or {}).get("gerp")
+            st.metric("GERP++ Score", f"{gerp_val:.2f}" if gerp_val is not None else "—")
+            st.caption("""
+            Measures "rejected substitutions" — the difference between neutral and observed evolutionary rates.
+            **Score range:** typically -12 to +6 | **Interpretation:** >4 highly constrained, 2-4 moderate, <2 weak/none.
+            Higher scores indicate positions under strong purifying selection across mammals.
+            """)
+        
+        with st.container(border=True):
+            st.markdown("**PhastCons 100-way** (100 Vertebrate Conservation)")
+            phast_val = (s.get("conservation") or {}).get("phastcons100way")
+            st.metric("PhastCons Score", f"{phast_val:.3f}" if phast_val is not None else "—")
+            st.caption("""
+            Posterior probability of conservation computed from 100 vertebrate genome alignment (phylo-HMM).
+            **Score range:** 0.0-1.0 | **Interpretation:** ≥0.95 very high, 0.9-0.95 high, 0.5-0.9 moderate, <0.5 low.
+            Higher scores indicate the position is highly conserved across vertebrate evolution.
+            """)
 
     with R:
-        st.subheader("In-silico / AI")
+        st.subheader("In-silico / AI Predictors")
+        
         am = s.get("alphamissense") or {}
         st.write("**AlphaMissense:**", f"{am.get('class') or '—'} (score={am.get('score')})")
-        st.caption("AI classifier trained on missense pathogenicity.")
-        st.write("**SIFT:**", f"{(s.get('sift') or {}).get('pred','—')} (score={(s.get('sift') or {}).get('score')})")
-        st.caption(f"Deleterious < {pri['sift_cutoff']}.")
-        st.write("**PolyPhen-2:**", f"{(s.get('polyphen') or {}).get('pred','—')} (score={(s.get('polyphen') or {}).get('score')})")
-        st.caption("Probably damaging typically > 0.85.")
+        st.caption("DeepMind AI classifier trained on primate and population data. Score 0-1; ≥0.8 pathogenic, ≤0.2 benign.")
+        
+        st.markdown("---")
+        
+        # SIFT with detailed explanation
+        sift_data = s.get('sift') or {}
+        sift_score = sift_data.get('score')
+        sift_pred = sift_data.get('pred', '—')
+        with st.container(border=True):
+            st.markdown("**SIFT** (Sorting Intolerant From Tolerant)")
+            s1, s2 = st.columns(2)
+            with s1:
+                st.metric("Prediction", sift_pred or "—")
+            with s2:
+                st.metric("Score", f"{sift_score:.3f}" if sift_score is not None else "—")
+            st.caption("""
+            Predicts if amino acid substitution affects protein function based on sequence homology.
+            **Score range:** 0.0-1.0 | **Thresholds:** <0.05 = Deleterious, ≥0.05 = Tolerated.
+            ⚠️ **Note:** SIFT uses OPPOSITE direction from PolyPhen — lower scores are MORE concerning.
+            """)
+        
+        # PolyPhen-2 with detailed explanation
+        pp_data = s.get('polyphen') or {}
+        pp_score = pp_data.get('score')
+        pp_pred = pp_data.get('pred', '—')
+        with st.container(border=True):
+            st.markdown("**PolyPhen-2** (Polymorphism Phenotyping v2)")
+            p1, p2 = st.columns(2)
+            with p1:
+                st.metric("Prediction", pp_pred or "—")
+            with p2:
+                st.metric("Score", f"{pp_score:.3f}" if pp_score is not None else "—")
+            st.caption("""
+            Predicts impact on protein structure/function using sequence and 3D structure features.
+            **Score range:** 0.0-1.0 | **Thresholds:** 0-0.15 Benign, 0.15-0.85 Possibly damaging, ≥0.85 Probably damaging.
+            Higher scores indicate higher probability of damaging effect on protein.
+            """)
+        
+        st.markdown("---")
+        
         st.write("**CADD (PHRED):**")
         gbar(safe_float(s.get("cadd_phred")), 0.0, 35.0, "", key="caddbar")
-        st.caption(f"≥{pri['cadd_cutoff']} high; ≥30 very high.")
+        st.caption(f"Combined Annotation Dependent Depletion. PHRED-scaled: ≥{pri['cadd_cutoff']} suggestive; ≥30 top 0.1% most deleterious.")
+        
         st.write("**REVEL:**")
         gbar(safe_float(s.get("revel")), 0.0, 1.0, "", key="revelbar")
-        st.caption(f"≥{pri['revel_cutoff']} suggestive; ≥{pri['revel_strong']} stronger.")
+        st.caption(f"Ensemble meta-predictor combining 13 tools. ≥{pri['revel_cutoff']} suggestive; ≥{pri['revel_strong']} stronger evidence.")
 
     # ---- Evidence table (structured overview) ----
     st.subheader("Structured evidence overview")
@@ -644,6 +911,9 @@ def render_batch():
                 "HGVS": hg, "Gene": s.get("gene"), "Consq": s.get("consequence"),
                 "Impact": s.get("impact"), "REVEL": s.get("revel"),
                 "CADD": s.get("cadd_phred"), "AF": s.get("gnomad_af"),
+                "Controls AF": s.get("gnomad_controls_af"),
+                "PopMax AF": s.get("gnomad_popmax_af"),
+                "Homozygotes": s.get("gnomad_nhomalt"),
                 "_summary": s
             })
     import pandas as pd
